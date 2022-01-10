@@ -10,6 +10,7 @@ from sklearn.preprocessing import normalize
 from sklearn.model_selection import train_test_split
 
 import os
+import json
 import argparse
 import numpy as np
 from tqdm import tqdm
@@ -40,25 +41,26 @@ def to_numpy(x):
 def parse_args():
     parser = argparse.ArgumentParser('MAE pre-training', add_help=False)
     parser.add_argument('--batch_size', default=512,  type=int)
-    parser.add_argument('--epochs',     default=4000, type=int)
+    parser.add_argument('--epochs',     default=2000, type=int)
     
-    parser.add_argument('--model',         default='mae_vit_base_patch16', type=str, metavar='MODEL')
     parser.add_argument('--input_size',    default=32, type=int)
     parser.add_argument('--mask_ratio',    default=0.75, type=float)
-    parser.add_argument('--norm_pix_loss', action='store_true')
-    parser.set_defaults(norm_pix_loss=False)
+    # parser.add_argument('--norm_pix_loss', action='store_true')
+    # parser.set_defaults(norm_pix_loss=True)
     
     parser.add_argument('--weight_decay',  type=float, default=0.05)
     
-    parser.add_argument('--lr',            type=float, default=2e-3)
+    parser.add_argument('--lr',            type=float, default=1e-3)
     parser.add_argument('--min_lr',        type=float, default=0.)
-    parser.add_argument('--warmup_epochs', type=int,   default=10)
+    parser.add_argument('--warmup_epochs', type=int,   default=250)
     
-    parser.add_argument('--output_dir', default='./output_dir/run1')
-    parser.add_argument('--log_dir',    default='./output_dir/run1')
+    parser.add_argument('--output_dir', default='./output_dir/cifar10/run9')
+    parser.add_argument('--log_dir',    default='./output_dir/cifar10/run9')
     parser.add_argument('--seed',       default=123, type=int)
     
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.norm_pix_loss = False
+    return args
 
 # --
 # Init
@@ -68,11 +70,14 @@ args = parse_args()
 assert args.output_dir is not None
 os.makedirs(args.output_dir, exist_ok=True)
 
+with open(os.path.join(args.output_dir, 'config.json'), 'w') as f:
+    f.write(json.dumps(vars(args)))
+
 device = torch.device('cuda')
 
 # fix the seed for reproducibility
-torch.manual_seed(args.seed)
-np.random.seed(args.seed)
+_ = torch.manual_seed(args.seed)
+_ = np.random.seed(args.seed)
 
 os.makedirs(args.log_dir, exist_ok=True)
 log_writer = SummaryWriter(log_dir=args.log_dir)
@@ -92,7 +97,7 @@ transform_test = transforms.Compose([
 ])
 
 ds_train = datasets.CIFAR10(
-    root='./data', train=True, download=False, transform=transform_train
+    root='./data', train=True, download=True, transform=transform_train
 )
 ds_valid = datasets.CIFAR10(
     root='./data', train=True, download=False, transform=transform_test
@@ -133,17 +138,23 @@ from functools import partial
 from models_mae import MaskedAutoencoderViT
 from torch import nn
 
+model_kwargs = {
+    "img_size" : 32,
+    "patch_size" : 8,
+    "embed_dim" : 768,
+    "depth" : 12,
+    "num_heads" : 12,
+    "decoder_embed_dim" : 512,
+    "decoder_depth" : 8,
+    "decoder_num_heads" : 16,
+    "mlp_ratio" : 4,    
+}
+with open(os.path.join(args.output_dir, 'model_kwargs.json'), 'w') as f:
+    f.write(json.dumps(model_kwargs))
+
 model = MaskedAutoencoderViT(
-    img_size=32,
-    patch_size=8,
-    embed_dim=512,
-    depth=8,
-    num_heads=8,
-    decoder_embed_dim=256,
-    decoder_depth=4,
-    decoder_num_heads=8,
-    mlp_ratio=4,
-    norm_layer=partial(nn.LayerNorm, eps=1e-6)
+    norm_layer=partial(nn.LayerNorm, eps=1e-6),
+    **model_kwargs
 )
 
 model = model.to(device)
@@ -210,14 +221,17 @@ for epoch in range(args.epochs):
             X_test = normalize(np.row_stack(X_test))
             y_test = np.hstack(y_test)
             
-            if (epoch == 0) or (epoch % 100 != 0):
+            if (epoch == 0) or (epoch % 100 != 0) or (epoch == args.epochs - 1):
                 sel = np.random.choice(X_valid.shape[0], int(X_valid.shape[0] // 10), replace=False)
             else:
                 sel = np.arange(X_valid.shape[0])
             
-            clf       = LinearSVC().fit(X_valid[sel], y_valid[sel])
-            valid_acc = (clf.predict(X_valid) == y_valid).mean()
-            test_acc  = (clf.predict(X_test) == y_test).mean()
+            try:
+                clf       = LinearSVC().fit(X_valid[sel], y_valid[sel])
+                valid_acc = (clf.predict(X_valid) == y_valid).mean()
+                test_acc  = (clf.predict(X_test) == y_test).mean()
+            except:
+                valid_acc, test_acc = -1, -1
             
             log_writer.add_scalar('acc/valid', float(valid_acc), epoch * len(dl_train))
             log_writer.add_scalar('acc/test',  float(test_acc),  epoch * len(dl_train))
@@ -228,6 +242,8 @@ for epoch in range(args.epochs):
 # !! learning rate schedule
 # ?? super convergence
 # !! change model capacity
+# !! change how encoder gets used to featurize ...
+#    ... noticed that loss doesn't always correlate w/ accuracy ...
 
 state_dict = model.cpu().state_dict()
-torch.save(state_dict, 'cifar10_model1.pt')
+torch.save(state_dict, os.path.join(args.output_dir, 'checkpoint.pt'))
